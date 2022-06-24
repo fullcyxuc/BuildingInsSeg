@@ -245,6 +245,7 @@ class InstanceSegPipline(nn.Module):
                         visit[neihbor] = 1
             nonlocal ccs
             ccs.append(cc)
+
         n = adjacency.size(0)
         nodes = range(n)
         visit = [0] * n
@@ -292,7 +293,8 @@ class InstanceSegPipline(nn.Module):
             proposal_num = torch.unique(proposal_idx_i).size(0)
             proposal_num_batch.append(proposal_num)
 
-            proposals_offset_i = utils.get_batch_offsets(proposal_idx_i, proposal_num)  # proposal offset (nProposal + 1)
+            proposals_offset_i = utils.get_batch_offsets(proposal_idx_i,
+                                                         proposal_num)  # proposal offset (nProposal + 1)
             proposals_offset.append(proposals_offset_i)
 
             proposal_idx_i, proposal_point_idx_i = proposal_idx_i.unsqueeze(1), proposal_point_idx_i.unsqueeze(1)
@@ -345,7 +347,8 @@ class InstanceSegPipline(nn.Module):
         clusters_coords_min = pointgroup_ops.sec_min(clusters_coords, clusters_offset.cuda())  # (nCluster, 3), float
         clusters_coords_max = pointgroup_ops.sec_max(clusters_coords, clusters_offset.cuda())  # (nCluster, 3), float
 
-        clusters_scale = 1 / ((clusters_coords_max - clusters_coords_min) / fullscale).max(1)[0] - 0.01  # (nCluster), float
+        clusters_scale = 1 / ((clusters_coords_max - clusters_coords_min) / fullscale).max(1)[
+            0] - 0.01  # (nCluster), float
         clusters_scale = torch.clamp(clusters_scale, min=None, max=scale)
 
         min_xyz = clusters_coords_min * clusters_scale.unsqueeze(-1)  # (nCluster, 3), float
@@ -482,18 +485,15 @@ class InstanceSegPipline(nn.Module):
 def model_fn_decorator(test=False):
     from BuildingInsSeg.util.config import cfg
 
-    semantic_criterion = nn.CrossEntropyLoss(ignore_index=cfg.ignore_label).to(cfg.device)
-    score_criterion = nn.BCELoss(reduction='none').to(cfg.device)
-
     def test_model_fn(batch, model, epoch):
-        coords = batch['locs'].cuda()                           # (N, 1 + 3), long, cuda, dimension 0 for batch_idx
-        voxel_coords = batch['voxel_locs'].cuda()               # (M, 1 + 3), long, cuda
-        p2v_map = batch['p2v_map'].cuda()                       # (N), int, cuda
-        v2p_map = batch['v2p_map'].cuda()                       # (M, 1 + maxActive), int, cuda
+        coords = batch['locs'].cuda()  # (N, 1 + 3), long, cuda, dimension 0 for batch_idx
+        voxel_coords = batch['voxel_locs'].cuda()  # (M, 1 + 3), long, cuda
+        p2v_map = batch['p2v_map'].cuda()  # (N), int, cuda
+        v2p_map = batch['v2p_map'].cuda()  # (M, 1 + maxActive), int, cuda
 
-        coords_float = batch['locs_float'].cuda()               # (N, 3), float32, cuda
-        feats = batch['feats'].cuda()                           # (N, C), float32, cuda
-        batch_offsets = batch['offsets'].cuda()                 # (B + 1), int, cuda
+        coords_float = batch['locs_float'].cuda()  # (N, 3), float32, cuda
+        feats = batch['feats'].cuda()  # (N, C), float32, cuda
+        batch_offsets = batch['offsets'].cuda()  # (B + 1), int, cuda
         spatial_shape = batch['spatial_shape']
 
         if cfg.use_coords:
@@ -522,214 +522,7 @@ def model_fn_decorator(test=False):
 
         return preds
 
-    def train_model_fn(batch, model, epoch):
-        ##### prepare input and forward
-        # batch {'locs': locs, 'voxel_locs': voxel_locs, 'p2v_map': p2v_map, 'v2p_map': v2p_map,
-        # 'locs_float': locs_float, 'feats': feats, 'labels': labels, 'instance_labels': instance_labels,
-        # 'instance_info': instance_infos, 'instance_pointnum': instance_pointnum,
-        # 'id': tbl, 'offsets': batch_offsets, 'spatial_shape': spatial_shape}
-        coords = batch['locs'].cuda()                           # (N, 1 + 3), long, cuda, dimension 0 for batch_idx
-        voxel_coords = batch['voxel_locs'].cuda()               # (M, 1 + 3), long, cuda
-        p2v_map = batch['p2v_map'].cuda()                       # (N), int, cuda
-        v2p_map = batch['v2p_map'].cuda()                       # (M, 1 + maxActive), int, cuda
-
-        coords_float = batch['locs_float'].cuda()               # (N, 3), float32, cuda
-        feats = batch['feats'].cuda()                           # (N, C), float32, cuda
-        labels = batch['labels'].cuda()                         # (N), long, cuda
-        instance_labels = batch['instance_labels'].cuda()       # (N), long, cuda, 0~total_nInst, -100
-
-        instance_info = batch['instance_info'].cuda()           # (N, 9), float32, cuda, (meanxyz, minxyz, maxxyz)
-        instance_pointnum = batch['instance_pointnum'].cuda()   # (total_nInst), int, cuda
-
-        batch_offsets = batch['offsets'].cuda()                 # (B + 1), int, cuda
-
-        spatial_shape = batch['spatial_shape']
-
-        if cfg.use_coords:
-            feats = torch.cat((feats, coords_float), 1)
-        voxel_feats = pointgroup_ops.voxelization(feats, v2p_map, cfg.mode)  # (M, C), float, cuda
-
-        input_ = spconv.SparseConvTensor(voxel_feats, voxel_coords.int(), spatial_shape, cfg.batch_size)
-
-        # get and unpack model result
-        ret = model(input_, p2v_map, coords_float, coords[:, 0].int(), batch_offsets, epoch)
-
-        embedding_feats = ret['embedding_feats']  # [B, N, F] embedding feats for calculating the embedding loss
-        semantic_scores = ret['semantic_scores']  # [N, nclass]
-        pt_offsets = ret['pt_offsets']  # (N, 3), float32, cuda
-        if (epoch > cfg.prepare_epochs):
-            scores, proposals_idx, proposals_offset = ret['proposal_scores']
-            # scores: (nProposal, 1) float, cuda
-            # proposals_idx: (sumNPoint, 2), int, cpu, dim 0 for cluster_id, dim 1 for corresponding point idxs in N
-            # proposals_offset: (nProposal + 1), int, cpu
-
-        loss_inp = {}
-        loss_inp['semantic_scores'] = (semantic_scores, labels)
-        loss_inp['embedding_feats'] = embedding_feats
-        loss_inp['pt_offsets'] = (pt_offsets, coords_float, instance_info, instance_labels)
-        if (epoch > cfg.prepare_epochs):
-            loss_inp['proposal_scores'] = (scores, proposals_idx, proposals_offset, instance_pointnum)
-
-        loss, loss_out, infos = loss_fn(loss_inp, epoch)
-
-        ##### accuracy / visual_dict / meter_dict
-        with torch.no_grad():
-            preds = {}
-            preds['semantic'] = semantic_scores
-            preds['pt_offsets'] = pt_offsets
-            if (epoch > cfg.prepare_epochs):
-                preds['score'] = scores
-                preds['proposals'] = (proposals_idx, proposals_offset)
-
-            visual_dict = {}
-            visual_dict['loss'] = loss
-            for k, v in loss_out.items():
-                visual_dict[k] = v[0]
-
-            meter_dict = {}
-            meter_dict['loss'] = (loss.item(), coords.shape[0])
-            for k, v in loss_out.items():
-                meter_dict[k] = (float(v[0]), v[1])
-
-        return loss, preds, visual_dict, meter_dict
-
-    def loss_fn(loss_inp, epoch):
-
-        loss_out = {}
-        infos = {}
-
-        '''semantic loss'''
-        semantic_scores, semantic_labels = loss_inp['semantic_scores']
-        # semantic_scores: (N, nClass), float32, cuda
-        # semantic_labels: (N), long, cuda
-
-        semantic_loss = semantic_criterion(semantic_scores, semantic_labels)
-        loss_out['semantic_loss'] = (semantic_loss, semantic_scores.shape[0])
-
-        '''offset loss'''
-        pt_offsets, coords, instance_info, instance_labels = loss_inp['pt_offsets']
-        # pt_offsets: (N, 3) or (N, 2), float, cuda
-        # coords: (N, 3), float32
-        # instance_info: (N, 9), float32 tensor (meanxyz, minxyz, maxxyz)
-        # instance_labels: (N), long
-
-        if pt_offsets.size(1) == 3:
-            gt_offsets = instance_info[:, :3] - coords  # (N, 3)
-        else:
-            gt_offsets = instance_info[:, :2] - coords[:, :2]  # (N, 3)
-        pt_diff = pt_offsets - gt_offsets  # (N, 3)
-        pt_dist = torch.sum(torch.abs(pt_diff), dim=-1)  # (N)
-        valid = (instance_labels != cfg.ignore_label).float()
-        offset_norm_loss = torch.sum(pt_dist * valid) / (torch.sum(valid) + 1e-6)
-
-        gt_offsets_norm = torch.norm(gt_offsets, p=2, dim=1)  # (N), float
-        gt_offsets_ = gt_offsets / (gt_offsets_norm.unsqueeze(-1) + 1e-8)
-        pt_offsets_norm = torch.norm(pt_offsets, p=2, dim=1)
-        pt_offsets_ = pt_offsets / (pt_offsets_norm.unsqueeze(-1) + 1e-8)
-        direction_diff = - (gt_offsets_ * pt_offsets_).sum(-1)  # (N)
-        offset_dir_loss = torch.sum(direction_diff * valid) / (torch.sum(valid) + 1e-6)
-
-        loss_out['offset_norm_loss'] = (offset_norm_loss, valid.sum())
-        loss_out['offset_dir_loss'] = (offset_dir_loss, valid.sum())
-
-        '''discriminative loss'''
-        embedding_feats = loss_inp['embedding_feats']
-        # embedding_feats: (B, N, F)
-
-        instance_labels_unique = torch.unique(instance_labels)
-        instance_labels_unique = instance_labels_unique[instance_labels_unique != cfg.ignore_label]
-        instance_num = instance_labels_unique.size(0)
-
-        # pull loss
-        pull_loss = 0.0
-        mu_feats = []  # the mean feature for a specific instance
-        for i in instance_labels_unique:
-            instance_feats_i = embedding_feats[instance_labels == i]  # [instance_i_pnum, F]
-
-            mu_feat_i = torch.mean(instance_feats_i, dim=0)  # [F,]
-            mu_feats.append(mu_feat_i)
-
-            pull_loss_i = torch.norm(instance_feats_i - mu_feat_i, dim=-1, p=2) - cfg.sigma_1
-            pull_loss_i = torch.where(pull_loss_i >= 0, pull_loss_i,
-                                      torch.zeros_like(pull_loss_i)) ** 2  # max(0, ||mu - fi||2 - sigma1)^2
-            pull_loss += torch.mean(pull_loss_i)
-        pull_loss /= instance_num
-
-        loss_out['pull_loss'] = (pull_loss, instance_num)
-
-        # push loss
-        push_loss = 0.0
-        for i, feat_i in enumerate(instance_labels_unique):
-            for j, feat_j in enumerate(instance_labels_unique):
-                if i != j:
-                    mu_feat_i = mu_feats[i]
-                    mu_feat_j = mu_feats[j]
-
-                    push_loss_ij = max(cfg.sigma_2 - torch.norm(mu_feat_i - mu_feat_j, dim=-1, p=2), 0) ** 2
-                    push_loss += push_loss_ij
-        push_loss /= (instance_num * (instance_num - 1))
-
-        loss_out['push_loss'] = (push_loss, instance_num * (instance_num - 1))
-
-        # reg loss
-        reg_loss = 0.0
-        for mu_feat in mu_feats:
-            reg_loss += torch.norm(mu_feat, dim=-1, p=2)
-        reg_loss /= instance_num
-
-        loss_out['reg_loss'] = (reg_loss, instance_num)
-
-        embedding_loss = cfg.weight_pull * pull_loss + cfg.weight_push * push_loss + cfg.weight_reg * reg_loss
-
-        loss_out['embedding_loss'] = (embedding_loss, instance_num)
-
-        if (epoch > cfg.prepare_epochs):
-            '''score loss'''
-            scores, proposals_idx, proposals_offset, instance_pointnum = loss_inp['proposal_scores']
-            # scores: (nProposal, 1), float32
-            # proposals_idx: (sumNPoint, 2), int, cpu, dim 0 for cluster_id, dim 1 for corresponding point idxs in N
-            # proposals_offset: (nProposal + 1), int, cpu
-            # instance_pointnum: (total_nInst), int
-
-            ious = pointgroup_ops.get_iou(proposals_idx[:, 1].contiguous(), proposals_offset, instance_labels,
-                                          instance_pointnum)  # (nProposal, nInstance), float
-            gt_ious, gt_instance_idxs = ious.max(1)  # (nProposal) float, long
-            gt_scores = get_segmented_scores(gt_ious, cfg.fg_thresh, cfg.bg_thresh)
-
-            score_loss = score_criterion(torch.sigmoid(scores.view(-1)), gt_scores)
-            score_loss = score_loss.mean()
-
-            loss_out['score_loss'] = (score_loss, gt_ious.shape[0])
-
-        ## total loss
-        loss = semantic_loss + embedding_loss + offset_norm_loss + offset_dir_loss
-
-        if epoch > cfg.prepare_epochs:
-            loss += score_loss
-
-        return loss, loss_out, infos
-
-    def get_segmented_scores(scores, fg_thresh=1.0, bg_thresh=0.0):
-        '''
-        :param scores: (N), float, 0~1
-        :return: segmented_scores: (N), float 0~1, >fg_thresh: 1, <bg_thresh: 0, mid: linear
-        '''
-        fg_mask = scores > fg_thresh
-        bg_mask = scores < bg_thresh
-        interval_mask = (fg_mask == 0) & (bg_mask == 0)
-
-        segmented_scores = (fg_mask > 0).float()
-        k = 1 / (fg_thresh - bg_thresh)
-        b = bg_thresh / (bg_thresh - fg_thresh)
-        segmented_scores[interval_mask] = scores[interval_mask] * k + b
-
-        return segmented_scores
-
-    if test:
-        fn = test_model_fn
-    else:
-        fn = train_model_fn
-    return fn
+    return test_model_fn
 
 
 if __name__ == '__main__':
